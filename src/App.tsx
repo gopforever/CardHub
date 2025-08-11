@@ -504,10 +504,6 @@ function Collections(){
     }
   }
 
-  // Refs for file inputs (defined ONCE here)
-  const csvInputRef = useRef<HTMLInputElement | null>(null)
-  const jsonInputRef = useRef<HTMLInputElement | null>(null)
-
   // Pricing
   type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string }[]; quote?: { price: number; at: string } }
   const setRowBusy = (id: string, b: boolean) => setRowLoading(prev => ({ ...prev, [id]: b }))
