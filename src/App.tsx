@@ -177,7 +177,7 @@ function useToasts() {
 }
 
 /* Price cache (localStorage) */
-type PriceData = { price: number; at: string } // at = ISO timestamp
+type PriceData = { price: number; at: string; source?: 'ebay-sold' | 'mock'; count?: number } // at = ISO timestamp
 const PRICE_TTL_MS = 10 * 60 * 1000
 const PRICE_CACHE_KEY = 'ct_price_cache'
 
@@ -195,7 +195,7 @@ function priceCacheGet(sig: string): PriceData | null {
   if (!data) return null
   const age = Date.now() - new Date(data.at).getTime()
   if (Number.isNaN(age)) return null
-  return { price: data.price, at: data.at }
+  return data
 }
 function priceCacheSet(sig: string, p: PriceData){
   const all = loadPriceCache()
@@ -505,13 +505,14 @@ function Collections(){
   }
 
   // Pricing
-  type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string }[]; quote?: { price: number; at: string } }
+  type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string; source?: 'ebay-sold' | 'mock'; count?: number }[]; quote?: { price: number; at: string; source?: 'ebay-sold' | 'mock'; count?: number } }
   const setRowBusy = (id: string, b: boolean) => setRowLoading(prev => ({ ...prev, [id]: b }))
 
-  const updatePriceFor = (id: string, item: CardItem, price: number, at: string) => {
+  const updatePriceFor = (id: string, item: CardItem, price: number, at: string, source?: 'ebay-sold' | 'mock', count?: number) => {
     const sig = sigOfItem(item)
-    priceCacheSet(sig, { price, at })
-    setPrices(prev => ({ ...prev, [id]: { price, at } }))
+    const entry: PriceData = { price, at, source, count }
+    priceCacheSet(sig, entry)
+    setPrices(prev => ({ ...prev, [id]: entry }))
   }
 
   const refreshPrices = async () => {
@@ -532,7 +533,7 @@ function Collections(){
       for (const it of items) {
         const q = data.quotes.find(q => q.id === it.id)
         if (!q) continue
-        updatePriceFor(it.id, it, q.price, q.at || now)
+        updatePriceFor(it.id, it, q.price, q.at || now, q.source, q.count)
       }
       toasts.success('Prices updated', `Fetched ${data.quotes.length} quotes`)
     } catch (e) {
@@ -551,7 +552,7 @@ function Collections(){
       const data = (await res.json()) as PriceResp
       if (!data.ok || !data.quote) throw new Error('Malformed response')
       const at = data.quote.at || new Date().toISOString()
-      updatePriceFor(it.id, it, data.quote.price, at)
+      updatePriceFor(it.id, it, data.quote.price, at, data.quote.source, data.quote.count)
       toasts.success('Price updated')
     } catch (e) {
       toasts.error('Row pricing failed', e instanceof Error ? e.message : 'Unknown error')
@@ -717,6 +718,18 @@ function Collections(){
                           <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-sm border ${stale ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
                             ${p.price.toFixed(2)} <span className="opacity-70">USD</span>
                           </span>
+                          {/* Source badge */}
+                          {p.source === 'ebay-sold' ? (
+                            <span className="text-[11px] rounded px-1.5 py-0.5 border border-emerald-200 bg-emerald-50 text-emerald-700"
+                                  title={`${p.count ?? 0} completed sales used`}>
+                              eBay sold
+                            </span>
+                          ) : (
+                            <span className="text-[11px] rounded px-1.5 py-0.5 border border-slate-200 bg-slate-50 text-slate-600"
+                                  title="No comps found or API key missing">
+                              Mock
+                            </span>
+                          )}
                           <span className={`text-xs ${stale ? 'text-amber-600' : 'text-slate-500'}`} title={new Date(p.at).toLocaleString()}>
                             {ageLabel(p.at)}{stale ? ' • stale' : ''}
                           </span>
@@ -804,13 +817,9 @@ function Market(){
       <h1 className="text-3xl font-bold">Market</h1>
       <div className="card p-6">
         <p className="text-slate-600">
-          Coming soon: live pricing from sources like eBay and SportsCardsPro. The header button
+          Coming soon: more live sources. Your header button
           "Ping Function" calls an example Netlify serverless function to prove functions are wired.
         </p>
-        <ul className="list-disc pl-6 text-slate-600 mt-2">
-          <li>When ready, we’ll add API keys via Netlify environment variables.</li>
-          <li>We’ll create webhook endpoints under <code>/.netlify/functions/*</code>.</li>
-        </ul>
       </div>
     </div>
   )

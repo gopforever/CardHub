@@ -1,7 +1,7 @@
 import type { Handler } from '@netlify/functions'
 
 // In-memory cache per lambda instance
-type CacheVal = { price: number; at: string; exp: number }
+type CacheVal = { price: number; at: string; exp: number; source: 'ebay-sold' | 'mock'; count?: number }
 const MEM: { map?: Map<string, CacheVal> } = (globalThis as any).__ct_price_mem || {}
 if (!MEM.map) MEM.map = new Map<string, CacheVal>()
 ;(globalThis as any).__ct_price_mem = MEM
@@ -9,7 +9,7 @@ if (!MEM.map) MEM.map = new Map<string, CacheVal>()
 const TEN_MIN = 10 * 60 * 1000
 
 type ItemIn = { id?: string; name: string; set?: string; number?: string; condition?: string }
-type Quote = { id?: string; price: number; at: string }
+type Quote = { id?: string; price: number; at: string; source: 'ebay-sold' | 'mock'; count?: number }
 
 function sigOf(i: ItemIn): string {
   const parts = [i.name, i.set || '', i.number || '', i.condition || 'Raw']
@@ -23,7 +23,7 @@ function median(nums: number[]): number | null {
   return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2
 }
 
-async function ebaySoldMedian(keywords: string, appId: string): Promise<number | null> {
+async function ebaySoldMedian(keywords: string, appId: string): Promise<{ price: number | null; count: number }> {
   try {
     const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
     const params = new URLSearchParams({
@@ -34,21 +34,15 @@ async function ebaySoldMedian(keywords: string, appId: string): Promise<number |
       'REST-PAYLOAD': 'true',
       'keywords': keywords,
       'paginationInput.entriesPerPage': '50',
-      'outputSelector': 'SellerInfo',
+      // Only SOLD completed listings
       'itemFilter(0).name': 'SoldItemsOnly',
       'itemFilter(0).value': 'true'
     })
     const res = await fetch(`${endpoint}?${params.toString()}`, { method: 'GET', headers: { 'Accept': 'application/json' } })
-    if (!res.ok) {
-      console.warn('eBay non-OK HTTP', res.status)
-      return null
-    }
+    if (!res.ok) return { price: null, count: 0 }
     const data = await res.json() as any
     const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0]
-    if (ack !== 'Success') {
-      console.warn('eBay ack not Success:', ack)
-      return null
-    }
+    if (ack !== 'Success') return { price: null, count: 0 }
     const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
     const prices: number[] = []
     for (const it of items) {
@@ -56,29 +50,23 @@ async function ebaySoldMedian(keywords: string, appId: string): Promise<number |
       const p = priceStr != null ? Number(priceStr) : NaN
       if (Number.isFinite(p)) prices.push(p)
     }
-    return median(prices)
-  } catch (e) {
-    console.warn('eBay fetch error', (e as any)?.message || e)
-    return null
+    return { price: median(prices), count: prices.length }
+  } catch {
+    return { price: null, count: 0 }
   }
 }
 
-async function getLivePrice(i: ItemIn): Promise<number | null> {
+async function getLiveQuote(i: ItemIn): Promise<{ price: number | null; count: number } | null> {
   const appId = process.env.EBAY_APP_ID
-  if (!appId) return null // No key => let caller decide fallback
-  try {
-    // Build simple keywords string
-    const keywords = [
-      i.name,
-      i.set,
-      i.number ? `#${i.number}` : '',
-      i.condition && i.condition !== 'Raw' ? i.condition : ''
-    ].filter(Boolean).join(' ').trim()
-    if (!keywords) return null
-    return await ebaySoldMedian(keywords, appId)
-  } catch {
-    return null
-  }
+  if (!appId) return null // No key => caller will decide fallback
+  const keywords = [
+    i.name,
+    i.set,
+    i.number ? `#${i.number}` : '',
+    i.condition && i.condition !== 'Raw' ? i.condition : ''
+  ].filter(Boolean).join(' ').trim()
+  if (!keywords) return { price: null, count: 0 }
+  return ebaySoldMedian(keywords, appId)
 }
 
 function nowISO(){ return new Date().toISOString() }
@@ -110,22 +98,28 @@ async function quoteFor(i: ItemIn): Promise<Quote | null> {
   const cached = MEM.map!.get(sig)
   const now = Date.now()
   if (cached && cached.exp > now) {
-    return { id: i.id, price: cached.price, at: cached.at }
+    return { id: i.id, price: cached.price, at: cached.at, source: cached.source, count: cached.count }
   }
 
-  // Try live price; fall back to mock on any issue
-  let price = await getLivePrice(i)
-  if (price == null) {
+  let source: 'ebay-sold' | 'mock' = 'mock'
+  let count = 0
+  let price: number | null = null
+
+  const live = await getLiveQuote(i)
+  if (live && live.price != null && live.count > 0) {
+    price = live.price
+    count = live.count
+    source = 'ebay-sold'
+  } else {
     price = mockFromSig(sig)
   }
 
   const at = nowISO()
-  MEM.map!.set(sig, { price, at, exp: now + TEN_MIN })
-  return { id: i.id, price, at }
+  MEM.map!.set(sig, { price, at, exp: now + TEN_MIN, source, count })
+  return { id: i.id, price, at, source, count }
 }
 
 export const handler: Handler = async (event) => {
-  // Never throw — always respond with 200 + ok:true for GET/POST so the UI doesn't see HTTP 500
   if (event.httpMethod === 'GET') {
     const { name = '', set = '', number = '', condition = '' } = event.queryStringParameters || {}
     if (!String(name).trim()) return bad(400, 'name is required')
@@ -147,8 +141,7 @@ export const handler: Handler = async (event) => {
         if (q) out.push(q)
       }
       return ok({ ok: true, quotes: out })
-    } catch (e) {
-      console.warn('POST parse/fetch error', (e as any)?.message || e)
+    } catch {
       return ok({ ok: true, quotes: [] })
     }
   }
