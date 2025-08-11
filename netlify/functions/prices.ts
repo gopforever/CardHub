@@ -24,55 +24,61 @@ function median(nums: number[]): number | null {
 }
 
 async function ebaySoldMedian(keywords: string, appId: string): Promise<number | null> {
-  const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
-  const params = new URLSearchParams({
-    'OPERATION-NAME': 'findCompletedItems',
-    'SERVICE-VERSION': '1.13.0',
-    'SECURITY-APPNAME': appId,
-    'RESPONSE-DATA-FORMAT': 'JSON',
-    'REST-PAYLOAD': 'true',
-    'keywords': keywords,
-    'paginationInput.entriesPerPage': '50',
-    'outputSelector': 'SellerInfo',
-    // Only sold (not just completed)
-    'itemFilter(0).name': 'SoldItemsOnly',
-    'itemFilter(0).value': 'true'
-  })
-
-  const res = await fetch(`${endpoint}?${params.toString()}`, {
-    method: 'GET',
-    headers: { 'Accept': 'application/json' }
-  })
-
-  if (!res.ok) throw new Error(`eBay HTTP ${res.status}`)
-  const data = await res.json() as any
-  const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0]
-  if (ack !== 'Success') throw new Error('eBay: non-success ack')
-
-  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
-  const prices: number[] = []
-  for (const it of items) {
-    const priceStr = it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ?? it?.sellingStatus?.[0]?.convertedCurrentPrice?.[0]?.__value__
-    const p = priceStr != null ? Number(priceStr) : NaN
-    if (Number.isFinite(p)) prices.push(p)
+  try {
+    const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
+    const params = new URLSearchParams({
+      'OPERATION-NAME': 'findCompletedItems',
+      'SERVICE-VERSION': '1.13.0',
+      'SECURITY-APPNAME': appId,
+      'RESPONSE-DATA-FORMAT': 'JSON',
+      'REST-PAYLOAD': 'true',
+      'keywords': keywords,
+      'paginationInput.entriesPerPage': '50',
+      'outputSelector': 'SellerInfo',
+      'itemFilter(0).name': 'SoldItemsOnly',
+      'itemFilter(0).value': 'true'
+    })
+    const res = await fetch(`${endpoint}?${params.toString()}`, { method: 'GET', headers: { 'Accept': 'application/json' } })
+    if (!res.ok) {
+      console.warn('eBay non-OK HTTP', res.status)
+      return null
+    }
+    const data = await res.json() as any
+    const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0]
+    if (ack !== 'Success') {
+      console.warn('eBay ack not Success:', ack)
+      return null
+    }
+    const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+    const prices: number[] = []
+    for (const it of items) {
+      const priceStr = it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ?? it?.sellingStatus?.[0]?.convertedCurrentPrice?.[0]?.__value__
+      const p = priceStr != null ? Number(priceStr) : NaN
+      if (Number.isFinite(p)) prices.push(p)
+    }
+    return median(prices)
+  } catch (e) {
+    console.warn('eBay fetch error', (e as any)?.message || e)
+    return null
   }
-  return median(prices)
 }
 
 async function getLivePrice(i: ItemIn): Promise<number | null> {
   const appId = process.env.EBAY_APP_ID
   if (!appId) return null // No key => let caller decide fallback
-
-  // Build simple keywords string
-  const keywords = [
-    i.name,
-    i.set,
-    i.number ? `#${i.number}` : '',
-    i.condition && i.condition !== 'Raw' ? i.condition : ''
-  ].filter(Boolean).join(' ').trim()
-
-  if (!keywords) return null
-  return ebaySoldMedian(keywords, appId)
+  try {
+    // Build simple keywords string
+    const keywords = [
+      i.name,
+      i.set,
+      i.number ? `#${i.number}` : '',
+      i.condition && i.condition !== 'Raw' ? i.condition : ''
+    ].filter(Boolean).join(' ').trim()
+    if (!keywords) return null
+    return await ebaySoldMedian(keywords, appId)
+  } catch {
+    return null
+  }
 }
 
 function nowISO(){ return new Date().toISOString() }
@@ -84,12 +90,19 @@ function ok(body: any){
     body: JSON.stringify(body)
   }
 }
-function err(statusCode: number, message: string){
+function bad(statusCode: number, message: string){
   return {
     statusCode,
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ ok: false, error: message })
   }
+}
+
+function mockFromSig(sig: string){
+  let hash = 0
+  for (let c of sig) hash = ((hash << 5) - hash + c.charCodeAt(0)) | 0
+  const base = Math.abs(hash % 2000) / 10 + 1 // 1.0 .. 200.0
+  return Math.round(base * 100) / 100
 }
 
 async function quoteFor(i: ItemIn): Promise<Quote | null> {
@@ -100,15 +113,10 @@ async function quoteFor(i: ItemIn): Promise<Quote | null> {
     return { id: i.id, price: cached.price, at: cached.at }
   }
 
-  // Try live price
+  // Try live price; fall back to mock on any issue
   let price = await getLivePrice(i)
   if (price == null) {
-    // Fallback mock if no key or no comps
-    // Deterministic-ish hash-based mock so it is stable per item signature
-    let hash = 0
-    for (let c of sig) hash = ((hash << 5) - hash + c.charCodeAt(0)) | 0
-    const base = Math.abs(hash % 2000) / 10 + 1 // 1.0 .. 200.0
-    price = Math.round(base * 100) / 100
+    price = mockFromSig(sig)
   }
 
   const at = nowISO()
@@ -117,20 +125,21 @@ async function quoteFor(i: ItemIn): Promise<Quote | null> {
 }
 
 export const handler: Handler = async (event) => {
-  try {
-    if (event.httpMethod === 'GET') {
-      const { name = '', set = '', number = '', condition = '' } = event.queryStringParameters || {}
-      if (!String(name).trim()) return err(400, 'name is required')
+  // Never throw — always respond with 200 + ok:true for GET/POST so the UI doesn't see HTTP 500
+  if (event.httpMethod === 'GET') {
+    const { name = '', set = '', number = '', condition = '' } = event.queryStringParameters || {}
+    if (!String(name).trim()) return bad(400, 'name is required')
 
-      const item: ItemIn = { name: String(name), set: String(set), number: String(number), condition: String(condition) }
-      const q = await quoteFor(item)
-      return ok({ ok: true, quote: q })
-    }
+    const item: ItemIn = { name: String(name), set: String(set), number: String(number), condition: String(condition) }
+    const q = await quoteFor(item)
+    return ok({ ok: true, quote: q })
+  }
 
-    if (event.httpMethod === 'POST') {
+  if (event.httpMethod === 'POST') {
+    try {
       const body = event.body ? JSON.parse(event.body) : {}
       const items = Array.isArray(body?.items) ? body.items as ItemIn[] : []
-      if (!items.length) return err(400, 'items required')
+      if (!items.length) return bad(400, 'items required')
 
       const out: Quote[] = []
       for (const it of items) {
@@ -138,12 +147,13 @@ export const handler: Handler = async (event) => {
         if (q) out.push(q)
       }
       return ok({ ok: true, quotes: out })
+    } catch (e) {
+      console.warn('POST parse/fetch error', (e as any)?.message || e)
+      return ok({ ok: true, quotes: [] })
     }
-
-    return err(405, 'Method not allowed')
-  } catch (e: any) {
-    return err(500, e?.message || 'Internal error')
   }
+
+  return bad(405, 'Method not allowed')
 }
 
 export default handler
