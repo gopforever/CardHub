@@ -130,7 +130,7 @@ function DemoWidget(){
 }
 
 /* =====================
-   Collections + Pricing + Media/Details + UX wins
+   Collections + Pricing + Media/Details + Toasts
    ===================== */
 
 type Condition = 'Raw' | 'PSA 10' | 'PSA 9' | 'BGS 9.5' | 'Other'
@@ -475,8 +475,6 @@ function Collections(){
     }
   }
 
-  const csvInputRef = useRef<HTMLInputElement | null>(null)
-  const jsonInputRef = useRef<HTMLInputElement | null>(null)
   const restoreJSON = async (file: File | null) => {
     if (!file) return
     setBusy('restore-json')
@@ -505,6 +503,10 @@ function Collections(){
       setBusy('idle')
     }
   }
+
+  // Refs for file inputs (defined ONCE here)
+  const csvInputRef = useRef<HTMLInputElement | null>(null)
+  const jsonInputRef = useRef<HTMLInputElement | null>(null)
 
   // Pricing
   type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string }[]; quote?: { price: number; at: string } }
@@ -848,6 +850,41 @@ function Modal({ title, children, actions, onClose }:{
           <div className="mt-6 flex justify-end gap-2">{actions}</div>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** Toast viewport (fixed stack, fade/slide micro-animations) */
+function ToastViewport({ toasts, dismiss }:{ toasts: Toast[]; dismiss: (id: string)=>void }){
+  const box = (t: Toast) => {
+    const tone = t.kind === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+      : t.kind === 'error' ? 'border-rose-200 bg-rose-50 text-rose-800'
+      : 'border-slate-200 bg-white text-slate-800'
+    return (
+      <div
+        key={t.id}
+        className={`pointer-events-auto min-w-[260px] max-w-[360px] rounded-xl shadow-lg border p-3
+                    transition-all duration-200 ${tone}
+                    ${t.closing ? 'opacity-0 translate-y-1' : 'opacity-100 translate-y-0'}`}
+      >
+        <div className="flex items-start gap-2">
+          <div className="mt-0.5">
+            {t.kind==='success' ? <IconCheck /> : t.kind==='error' ? <IconX /> : <IconInfo />}
+          </div>
+          <div className="flex-1">
+            <div className="font-semibold">{t.title}</div>
+            {t.msg ? <div className="text-sm opacity-80">{t.msg}</div> : null}
+          </div>
+          <button className="opacity-60 hover:opacity-100" onClick={()=>dismiss(t.id)} aria-label="Dismiss">
+            <IconX />
+          </button>
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none">
+      {toasts.map(box)}
     </div>
   )
 }
