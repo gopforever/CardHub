@@ -129,11 +129,23 @@ function DemoWidget(){
 }
 
 /* =====================
-   Collections + Pricing + UX wins
+   Collections + Pricing + Media/Details
    ===================== */
 
 type Condition = 'Raw' | 'PSA 10' | 'PSA 9' | 'BGS 9.5' | 'Other'
-type CardItem = { id: string; name: string; set: string; number: string; condition: Condition; qty: number }
+type Density = 'comfortable' | 'compact'
+
+type CardItem = {
+  id: string;
+  name: string;
+  set: string;
+  number: string;
+  condition: Condition;
+  qty: number;
+  image?: string;
+  purchasePrice?: number; // per unit USD
+  notes?: string;
+}
 
 type SortKey = 'name' | 'set' | 'number' | 'condition' | 'qty'
 type SortDir = 'asc' | 'desc'
@@ -198,50 +210,37 @@ function ageLabel(iso: string){
   const days = Math.floor(hrs/24); return days + 'd ago'
 }
 
-function ToastViewport({ toasts, dismiss }:{ toasts: Toast[]; dismiss: (id: string)=>void }) {
-  return (
-    <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-3 w-80">
-      {toasts.map(t => <ToastCard key={t.id} toast={t} onDismiss={() => dismiss(t.id)} />)}
-    </div>
-  )
+/* Helpers */
+const DEFAULT_PLACEHOLDER = (label: string) => {
+  const text = encodeURIComponent(label.slice(0, 1).toUpperCase() || 'C')
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='80' height='80'><rect width='100%' height='100%' rx='10' ry='10' fill='#e2e8f0'/><text x='50%' y='54%' text-anchor='middle' font-size='34' font-family='system-ui, Segoe UI, sans-serif' fill='#475569'>${text}</text></svg>`
+  return 'data:image/svg+xml;utf8,' + svg
 }
-function ToastCard({ toast, onDismiss }:{ toast: Toast; onDismiss: ()=>void }) {
-  const [mounted, setMounted] = useState(false)
-  useEffect(() => { const id = requestAnimationFrame(()=>setMounted(true)); return ()=>cancelAnimationFrame(id) }, [])
-  const bg = toast.kind === 'success' ? 'bg-emerald-600' : toast.kind === 'error' ? 'bg-rose-600' : 'bg-slate-800'
-  const Icon = toast.kind === 'success' ? IconCheck : toast.kind === 'error' ? IconX : IconInfo
-  const entering = mounted && !toast.closing
-  const base = 'text-white rounded-xl shadow-soft p-3 transition-all duration-200 ease-out'
-  const motion = entering ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-2 scale-[0.98]'
-  return (
-    <div className={`${base} ${bg} ${motion}`}>
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5"><Icon /></div>
-        <div className="flex-1">
-          <div className="font-semibold">{toast.title}</div>
-          {toast.msg && <div className="text-white/90 text-sm">{toast.msg}</div>}
-        </div>
-        <button className="opacity-80 hover:opacity-100" onClick={onDismiss} aria-label="Dismiss"><IconX /></button>
-      </div>
-    </div>
-  )
+
+function validUrl(u?: string){
+  if (!u) return false
+  try { const x = new URL(u); return x.protocol.startsWith('http') } catch { return false }
 }
 
 /* CSV helpers */
 const csvEscape = (s: string) => `"${s.replace(/"/g, '""')}"`
+const CSV_HEADERS_BASE = ['name','set','number','condition','qty']
+const CSV_HEADERS_EXTRA = ['image','purchasePrice','notes']
+
 function toCSV(rows: CardItem[]) {
-  const header = ['name','set','number','condition','qty'].join(',')
+  const header = [...CSV_HEADERS_BASE, ...CSV_HEADERS_EXTRA].join(',')
   const body = rows.map((r: CardItem)=>[
-    csvEscape(r.name), csvEscape(r.set), csvEscape(r.number), csvEscape(r.condition), String(r.qty)
+    csvEscape(r.name), csvEscape(r.set), csvEscape(r.number), csvEscape(r.condition), String(r.qty),
+    csvEscape(r.image || ''), String(r.purchasePrice ?? ''), csvEscape(r.notes || '')
   ].join(',')).join('\n')
   return `${header}\n${body}`
 }
 function parseCSV(text: string): Omit<CardItem,'id'>[] {
   const lines = text.split(/\r?\n/).filter(Boolean)
   if (!lines.length) return []
-  const header = lines[0].split(/,(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)/).map(h=>h.trim().toLowerCase())
+  const header = lines[0].split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/).map(h=>h.trim().toLowerCase())
   const idx = (k:string)=> header.indexOf(k)
-  const need = ['name','set','number','condition','qty']
+  const need = CSV_HEADERS_BASE
   if (!need.every(k=>idx(k)>=0)) return []
   const rows: Omit<CardItem,'id'>[] = []
   for (let i=1;i<lines.length;i++){
@@ -253,7 +252,11 @@ function parseCSV(text: string): Omit<CardItem,'id'>[] {
     const number = unq(cols[idx('number')] || '').trim()
     const condition = (unq(cols[idx('condition')] || 'Raw').trim() as Condition) || 'Raw'
     const qty = Math.max(0, parseInt(unq(cols[idx('qty')] || '1').trim() || '1')) || 1
-    rows.push({ name, set, number, condition, qty })
+    const image = idx('image')>=0 ? unq(cols[idx('image')] || '').trim() : ''
+    const purchasePriceRaw = idx('purchaseprice')>=0 ? unq(cols[idx('purchaseprice')] || '').trim() : ''
+    const purchasePrice = purchasePriceRaw ? Math.max(0, parseFloat(purchasePriceRaw)) : undefined
+    const notes = idx('notes')>=0 ? unq(cols[idx('notes')] || '').trim() : ''
+    rows.push({ name, set, number, condition, qty, image, purchasePrice, notes })
   }
   return rows
 }
@@ -266,8 +269,12 @@ function Collections(){
     return raw ? JSON.parse(raw) as CardItem[] : []
   })
   const [draft, setDraft] = useState<Omit<CardItem,'id'>>({
-    name: '', set: '', number: '', condition: 'Raw', qty: 1
+    name: '', set: '', number: '', condition: 'Raw', qty: 1, image:'', purchasePrice: undefined, notes:''
   })
+
+  // Density
+  const [density, setDensity] = useState<Density>(()=> (localStorage.getItem('ct_density') as Density) || 'comfortable')
+  useEffect(()=>{ localStorage.setItem('ct_density', density) }, [density])
 
   // Filters + sorting
   const [search, setSearch] = useState('')
@@ -277,7 +284,7 @@ function Collections(){
 
   // Quick edit modal
   const [editing, setEditing] = useState<CardItem | null>(null)
-  const [editDraft, setEditDraft] = useState<Omit<CardItem,'id'>>({ name:'', set:'', number:'', condition:'Raw', qty:1 })
+  const [editDraft, setEditDraft] = useState<Omit<CardItem,'id'>>({ name:'', set:'', number:'', condition:'Raw', qty:1, image:'', purchasePrice: undefined, notes:'' })
 
   // File inputs + busy state
   const [busy, setBusy] = useState<BusyKind>('idle')
@@ -312,7 +319,7 @@ function Collections(){
   const visible = useMemo<CardItem[]>(() => {
     const q = search.trim().toLowerCase()
     const filtered = items.filter((i: CardItem) => {
-      const matchesQ = !q || [i.name, i.set, i.number, i.condition].some(v=>String(v).toLowerCase().includes(q))
+      const matchesQ = !q || [i.name, i.set, i.number, i.condition, i.notes || ''].some(v=>String(v).toLowerCase().includes(q))
       const matchesC = condFilter === 'All' || i.condition === condFilter
       return matchesQ && matchesC
     })
@@ -327,8 +334,14 @@ function Collections(){
 
   const add = () => {
     if (!draft.name.trim()) { nameInputRef.current?.focus(); return }
-    setItems(prev => [...prev, { ...draft, id: crypto.randomUUID() }])
-    setDraft({ name:'', set:'', number:'', condition:'Raw', qty:1 })
+    const clean: Omit<CardItem,'id'> = {
+      ...draft,
+      image: validUrl(draft.image) ? draft.image : '',
+      purchasePrice: draft.purchasePrice && draft.purchasePrice > 0 ? Number(draft.purchasePrice) : undefined,
+      notes: (draft.notes || '').trim()
+    }
+    setItems(prev => [...prev, { ...clean, id: crypto.randomUUID() }])
+    setDraft({ name:'', set:'', number:'', condition:'Raw', qty:1, image:'', purchasePrice: undefined, notes:'' })
     toasts.success('Card added', 'Your card was added to the collection.')
   }
   const remove = (id:string) => {
@@ -344,11 +357,20 @@ function Collections(){
 
   const openEdit = (item: CardItem) => {
     setEditing(item)
-    setEditDraft({ name:item.name, set:item.set, number:item.number, condition:item.condition, qty:item.qty })
+    setEditDraft({
+      name:item.name, set:item.set, number:item.number, condition:item.condition, qty:item.qty,
+      image: item.image || '', purchasePrice: item.purchasePrice, notes: item.notes || ''
+    })
   }
   const saveEdit = () => {
     if (!editing) return
-    const updated: CardItem = { ...editing, ...editDraft }
+    const updated: CardItem = {
+      ...editing,
+      ...editDraft,
+      image: validUrl(editDraft.image) ? editDraft.image : '',
+      purchasePrice: editDraft.purchasePrice && editDraft.purchasePrice > 0 ? Number(editDraft.purchasePrice) : undefined,
+      notes: (editDraft.notes || '').trim()
+    }
     setItems(prev => prev.map(i => i.id === editing.id ? updated : i))
     // Refresh price from cache for the new signature (or clear if none)
     const sig = sigOfItem(updated)
@@ -383,14 +405,16 @@ function Collections(){
     toasts.info('Backup saved')
   }
 
-  // Importers with CSV dedupe
+  // Importers (dedupe by signature; merge qty)
+  const csvInputRef = useRef<HTMLInputElement | null>(null)
+  const jsonInputRef = useRef<HTMLInputElement | null>(null)
   const handleCSVChosen = async (file: File | null) => {
     if (!file) return
     setBusy('import-csv')
     try {
       const text = await file.text()
       const rows = parseCSV(text)
-      if (!rows.length) { toasts.error('Import failed', 'No valid rows. Headers: name,set,number,condition,qty'); return }
+      if (!rows.length) { toasts.error('Import failed', 'No valid rows. Headers: name,set,number,condition,qty[,image,purchasePrice,notes]'); return }
 
       setItems(prev => {
         const list = [...prev]
@@ -403,18 +427,39 @@ function Collections(){
         for (const r of rows) {
           const sig = sigOfItem({ ...r, id: '', qty: 0 } as CardItem)
           const eIdx = existingIndex.get(sig)
+          const normalized: Omit<CardItem,'id'> = {
+            ...r,
+            image: validUrl(r.image) ? r.image : '',
+            purchasePrice: r.purchasePrice && r.purchasePrice > 0 ? Number(r.purchasePrice) : undefined,
+            notes: (r.notes || '').trim()
+          }
           if (eIdx != null) {
-            list[eIdx] = { ...list[eIdx], qty: list[eIdx].qty + r.qty }
+            // merge qty; fill blanks
+            const curr = list[eIdx]
+            list[eIdx] = {
+              ...curr,
+              qty: curr.qty + normalized.qty,
+              image: curr.image || normalized.image,
+              purchasePrice: curr.purchasePrice ?? normalized.purchasePrice,
+              notes: curr.notes || normalized.notes
+            }
             merged++
             continue
           }
           const nIdx = newIndex.get(sig)
           if (nIdx != null) {
-            list[nIdx] = { ...list[nIdx], qty: list[nIdx].qty + r.qty }
+            const curr = list[nIdx]
+            list[nIdx] = {
+              ...curr,
+              qty: curr.qty + normalized.qty,
+              image: curr.image || normalized.image,
+              purchasePrice: curr.purchasePrice ?? normalized.purchasePrice,
+              notes: curr.notes || normalized.notes
+            }
             merged++
             continue
           }
-          const item: CardItem = { id: crypto.randomUUID(), ...r }
+          const item: CardItem = { id: crypto.randomUUID(), ...normalized }
           list.push(item)
           newIndex.set(sig, list.length - 1)
           created++
@@ -444,7 +489,10 @@ function Collections(){
         set: String(it.set || '').trim(),
         number: String(it.number || '').trim(),
         condition: (['Raw','PSA 10','PSA 9','BGS 9.5','Other'].includes(String(it.condition)) ? it.condition : 'Raw') as Condition,
-        qty: Math.max(0, Number(it.qty) || 0)
+        qty: Math.max(0, Number(it.qty) || 0),
+        image: validUrl(String(it.image || '')) ? String(it.image) : '',
+        purchasePrice: it.purchasePrice && it.purchasePrice > 0 ? Number(it.purchasePrice) : undefined,
+        notes: String(it.notes || '').trim()
       })).filter((i: CardItem) => i.name)
       setItems(clean)
       setPrices({}) // reset pricing when restoring
@@ -459,7 +507,7 @@ function Collections(){
 
   // Pricing
   type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string }[]; quote?: { price: number; at: string } }
-  const setRowBusy = (id: string, busy: boolean) => setRowLoading(prev => ({ ...prev, [id]: busy }))
+  const setRowBusy = (id: string, b: boolean) => setRowLoading(prev => ({ ...prev, [id]: b }))
 
   const updatePriceFor = (id: string, item: CardItem, price: number, at: string) => {
     const sig = sigOfItem(item)
@@ -513,11 +561,15 @@ function Collections(){
     }
   }
 
+  // Totals
   const totalQty = items.reduce((a,b)=>a+b.qty,0)
   const totalEst = items.reduce((sum, i)=> sum + (prices[i.id]?.price || 0) * i.qty, 0)
+  const totalCost = items.reduce((sum, i)=> sum + (i.purchasePrice || 0) * i.qty, 0)
+  const totalProfit = totalEst - totalCost
 
+  // Table helpers
   const Th = ({ k, label }:{ k: SortKey; label: string }) => (
-    <th className="px-4 py-2 cursor-pointer select-none" onClick={()=>onHeaderClick(k)}>
+    <th className={`px-4 ${density==='compact'?'py-1.5':'py-2'} cursor-pointer select-none`} onClick={()=>onHeaderClick(k)}>
       <span className="inline-flex items-center gap-1">
         {label}
         {sortKey===k && <span aria-hidden>{sortDir==='asc'?'▲':'▼'}</span>}
@@ -529,11 +581,18 @@ function Collections(){
 
   return (
     <div className="space-y-6 relative">
-      <h1 className="text-3xl font-bold">My Collection</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold">My Collection</h1>
+        <div className="flex items-center gap-2 text-sm">
+          <span className="text-slate-500">Density:</span>
+          <button className={`btn border ${density==='comfortable'?'bg-slate-100':''}`} onClick={()=>setDensity('comfortable')}>Comfortable</button>
+          <button className={`btn border ${density==='compact'?'bg-slate-100':''}`} onClick={()=>setDensity('compact')}>Compact</button>
+        </div>
+      </div>
 
       {/* Add row */}
       <div className="card p-4 space-y-4">
-        <div className="grid md:grid-cols-5 gap-3">
+        <div className="grid md:grid-cols-6 gap-3">
           <input ref={nameInputRef} className="border rounded-xl px-3 py-2" placeholder="Card name" value={draft.name}
             onChange={e=>setDraft({...draft, name:e.target.value})}/>
           <input className="border rounded-xl px-3 py-2" placeholder="Set" value={draft.set}
@@ -544,12 +603,16 @@ function Collections(){
             onChange={e=>setDraft({...draft, condition:e.target.value as Condition})}>
             <option>Raw</option><option>PSA 10</option><option>PSA 9</option><option>BGS 9.5</option><option>Other</option>
           </select>
+          <input className="border rounded-xl px-3 py-2" placeholder="Image URL (optional)" value={draft.image || ''}
+            onChange={e=>setDraft({...draft, image:e.target.value})}/>
           <div className="flex gap-2">
-            <input type="number" min="1" className="border rounded-xl px-3 py-2 w-24" value={draft.qty}
-              onChange={e=>setDraft({...draft, qty: Math.max(1, parseInt(e.target.value||'1'))})}/>
+            <input type="number" min="0" step="0.01" className="border rounded-xl px-3 py-2 w-28" placeholder="Purchase $" value={draft.purchasePrice ?? ''}
+              onChange={e=>setDraft({...draft, purchasePrice: e.target.value===''? undefined : Math.max(0, parseFloat(e.target.value || '0'))})}/>
             <button className="btn-primary" onClick={add}>Add</button>
           </div>
         </div>
+        <textarea className="border rounded-xl px-3 py-2 w-full" rows={2} placeholder="Notes (optional)"
+          value={draft.notes || ''} onChange={e=>setDraft({...draft, notes:e.target.value})}/>
       </div>
 
       {/* Toolbar */}
@@ -559,7 +622,7 @@ function Collections(){
             <div className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"><IconSearch className="opacity-50" /></div>
             <input
               className="border rounded-xl pl-10 pr-3 py-2 w-64"
-              placeholder="Search name, set, #, condition"
+              placeholder="Search name, set, #, condition, notes"
               value={search}
               onChange={(e)=>setSearch(e.target.value)}
             />
@@ -609,13 +672,16 @@ function Collections(){
           <table className="w-full text-left">
             <thead className="bg-slate-100">
               <tr>
+                <th className={`px-3 ${density==='compact'?'py-1.5':'py-2'}`}>Img</th>
                 <Th k="name" label="Name" />
                 <Th k="set" label="Set" />
                 <Th k="number" label="#" />
                 <Th k="condition" label="Condition" />
-                <th className="px-4 py-2">Price</th>
+                <th className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>Price</th>
+                <th className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>Purchase</th>
+                <th className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>ROI</th>
                 <Th k="qty" label="Qty" />
-                <th className="px-4 py-2"></th>
+                <th className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}></th>
               </tr>
             </thead>
             <tbody>
@@ -623,13 +689,28 @@ function Collections(){
                 const p = prices[i.id]
                 const isBusy = !!rowLoading[i.id] || (busy==='pricing' && !p)
                 const stale = p ? isStale(p.at) : false
+                const unitCost = i.purchasePrice || 0
+                const unitPrice = p?.price || 0
+                const profit = (unitPrice - unitCost) * i.qty
+                const roi = unitCost > 0 ? ((unitPrice - unitCost) / unitCost) * 100 : null
+                const roiText = roi == null ? '—' : (roi >= 0 ? `+${roi.toFixed(0)}%` : `${roi.toFixed(0)}%`)
+                const roiColor = roi == null ? 'text-slate-500' : roi >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                const imgSrc = validUrl(i.image) ? i.image! : DEFAULT_PLACEHOLDER(i.name)
+
                 return (
                   <tr key={i.id} className="border-t hover:bg-slate-50">
-                    <td className="px-4 py-2">{i.name}</td>
-                    <td className="px-4 py-2">{i.set}</td>
-                    <td className="px-4 py-2">{i.number}</td>
-                    <td className="px-4 py-2">{i.condition}</td>
-                    <td className="px-4 py-2">
+                    <td className={`px-3 ${density==='compact'?'py-1.5':'py-2'}`}>
+                      <img src={imgSrc} alt={i.name} className="h-12 w-12 object-cover rounded-lg border border-slate-200 bg-white"
+                        onError={(e)=>{ const t = e.target as HTMLImageElement; t.src = DEFAULT_PLACEHOLDER(i.name) }} />
+                    </td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>
+                      <div className="font-medium">{i.name}</div>
+                      {i.notes ? <div className="text-xs text-slate-500 line-clamp-1" title={i.notes}>{i.notes}</div> : null}
+                    </td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>{i.set}</td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>{i.number}</td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>{i.condition}</td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>
                       {isBusy ? (
                         <span className="inline-block h-6 w-28 rounded bg-slate-200 animate-pulse align-middle" />
                       ) : p ? (
@@ -650,8 +731,13 @@ function Collections(){
                         </button>
                       )}
                     </td>
-                    <td className="px-4 py-2">{i.qty}</td>
-                    <td className="px-4 py-2 text-right space-x-2">
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>${(unitCost || 0).toFixed(2)}</td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>
+                      <div className={`text-sm font-medium ${roiColor}`}>{roiText}</div>
+                      <div className="text-xs text-slate-500">{profit>=0?'+':'-'}${Math.abs(profit).toFixed(2)} total</div>
+                    </td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'}`}>{i.qty}</td>
+                    <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} text-right space-x-2`}>
                       <button className="btn border" onClick={()=>openEdit(i)}>Edit</button>
                       <button className="btn border" onClick={()=>remove(i.id)}>Remove</button>
                     </td>
@@ -659,17 +745,17 @@ function Collections(){
                 )
               })}
               {visible.length === 0 && (
-                <tr><td className="px-4 py-6 text-slate-500" colSpan={7}>No results. Try adjusting filters.</td></tr>
+                <tr><td className="px-4 py-6 text-slate-500" colSpan={10}>No results. Try adjusting filters.</td></tr>
               )}
             </tbody>
             {items.length>0 && (
               <tfoot>
                 <tr className="border-t bg-slate-50">
-                  <td className="px-4 py-2 font-semibold" colSpan={4}>Totals</td>
-                  <td className="px-4 py-2 font-semibold">
-                    Est. Value: ${totalEst.toFixed(2)}
-                  </td>
-                  <td className="px-4 py-2 font-semibold">{totalQty}</td>
+                  <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} font-semibold`} colSpan={5}>Totals</td>
+                  <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} font-semibold`}>Est. Value: ${totalEst.toFixed(2)}</td>
+                  <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} font-semibold`}>Cost: ${totalCost.toFixed(2)}</td>
+                  <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} font-semibold`}>Profit: ${totalProfit.toFixed(2)}</td>
+                  <td className={`px-4 ${density==='compact'?'py-1.5':'py-2'} font-semibold`}>{totalQty}</td>
                   <td></td>
                 </tr>
               </tfoot>
@@ -697,9 +783,13 @@ function Collections(){
               onChange={e=>setEditDraft({...editDraft, condition:e.target.value as Condition})}>
               <option>Raw</option><option>PSA 10</option><option>PSA 9</option><option>BGS 9.5</option><option>Other</option>
             </select>
-            <input type="number" min="0" className="border rounded-xl px-3 py-2 w-24" value={editDraft.qty}
-              onChange={e=>setEditDraft({...editDraft, qty: Math.max(0, parseInt(e.target.value||'0'))})}/>
+            <input className="border rounded-xl px-3 py-2" placeholder="Image URL" value={editDraft.image || ''}
+              onChange={e=>setEditDraft({...editDraft, image:e.target.value})}/>
+            <input type="number" min="0" step="0.01" className="border rounded-xl px-3 py-2" placeholder="Purchase $"
+              value={editDraft.purchasePrice ?? ''} onChange={e=>setEditDraft({...editDraft, purchasePrice: e.target.value===''? undefined : Math.max(0, parseFloat(e.target.value || '0'))})}/>
           </div>
+          <textarea className="border rounded-xl px-3 py-2 w-full" rows={4} placeholder="Notes"
+            value={editDraft.notes || ''} onChange={e=>setEditDraft({...editDraft, notes:e.target.value})}/>
         </Modal>
       )}
 
