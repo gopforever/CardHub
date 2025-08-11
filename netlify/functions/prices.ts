@@ -23,30 +23,56 @@ function median(nums: number[]): number | null {
   return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2
 }
 
-type EbayPass = { keywords: string; status?: number; ack?: string; count?: number }
+type EbayDiag = { status: number; ack: string; count: number; bodyHint?: string }
+type EbayResult = { price: number | null; diag: EbayDiag }
 
-async function ebaySoldMedian(keywords: string, appId: string): Promise<{ price: number | null; count: number; status: number; ack: string }> {
-  try {
-    const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
-    const params = new URLSearchParams({
-      'OPERATION-NAME': 'findCompletedItems',
-      'SERVICE-VERSION': '1.13.0',
-      'SECURITY-APPNAME': appId,
-      'RESPONSE-DATA-FORMAT': 'JSON',
-      'REST-PAYLOAD': 'true',
-      'GLOBAL-ID': 'EBAY-US',
-      'keywords': keywords,
-      'paginationInput.entriesPerPage': '50',
-      // Only SOLD completed listings
-      'itemFilter(0).name': 'SoldItemsOnly',
-      'itemFilter(0).value': 'true'
-    })
-    const res = await fetch(`${endpoint}?${params.toString()}`, { method: 'GET', headers: { 'Accept': 'application/json' } })
+async function ebayFindCompleted(keywords: string, appId: string): Promise<EbayResult> {
+  const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
+  const params = new URLSearchParams({
+    'OPERATION-NAME': 'findCompletedItems',
+    'SERVICE-VERSION': '1.13.0',
+    'RESPONSE-DATA-FORMAT': 'JSON',
+    'REST-PAYLOAD': 'true',
+    'GLOBAL-ID': 'EBAY-US',
+    'SECURITY-APPNAME': appId,
+    'keywords': keywords,
+    'paginationInput.entriesPerPage': '50',
+    'itemFilter(0).name': 'SoldItemsOnly',
+    'itemFilter(0).value': 'true'
+  })
+
+  // We'll try two header sets; some environments are picky.
+  const headerSets = [
+    {
+      'Accept': 'application/json',
+      'User-Agent': 'CardTrack/1.0 (+netlify)',
+      'X-EBAY-SOA-OPERATION-NAME': 'findCompletedItems',
+      'X-EBAY-SOA-SERVICE-VERSION': '1.13.0',
+      'X-EBAY-SOA-GLOBAL-ID': 'EBAY-US',
+      'X-EBAY-SOA-SECURITY-APPNAME': appId,
+      'X-EBAY-SOA-REQUEST-DATA-FORMAT': 'JSON',
+      'X-EBAY-SOA-RESPONSE-DATA-FORMAT': 'JSON'
+    },
+    {
+      'Accept': 'application/json',
+      'User-Agent': 'CardTrack/1.0 (+netlify)'
+    }
+  ] as Record<string,string>[]
+
+  for (let attempt = 0; attempt < headerSets.length; attempt++) {
+    const res = await fetch(`${endpoint}?${params.toString()}`, { method: 'GET', headers: headerSets[attempt] })
     const status = res.status
-    if (!res.ok) return { price: null, count: 0, status, ack: 'HTTP ' + status }
-    const data = await res.json() as any
+    if (!res.ok) {
+      let hint = ''
+      try { hint = (await res.text()).slice(0, 200) } catch {}
+      return { price: null, diag: { status, ack: 'HTTP ' + status, count: 0, bodyHint: hint } }
+    }
+    let data: any
+    try { data = await res.json() } catch (e: any) {
+      return { price: null, diag: { status, ack: 'Bad JSON', count: 0, bodyHint: (e?.message || 'parse error').slice(0,140) } }
+    }
     const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0] ?? 'Unknown'
-    if (ack !== 'Success') return { price: null, count: 0, status, ack }
+    if (ack !== 'Success') return { price: null, diag: { status, ack, count: 0 } }
     const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
     const prices: number[] = []
     for (const it of items) {
@@ -54,40 +80,36 @@ async function ebaySoldMedian(keywords: string, appId: string): Promise<{ price:
       const p = priceStr != null ? Number(priceStr) : NaN
       if (Number.isFinite(p)) prices.push(p)
     }
-    return { price: median(prices), count: prices.length, status, ack }
-  } catch (e: any) {
-    return { price: null, count: 0, status: 0, ack: e?.message || 'error' }
+    return { price: prices.length ? median(prices) : null, diag: { status, ack, count: prices.length } }
   }
+
+  return { price: null, diag: { status: 0, ack: 'no-attempt', count: 0 } }
 }
 
 function buildKeywordPasses(i: ItemIn): string[] {
   const base = [i.name, i.set, i.number, (i.condition && i.condition !== 'Raw') ? i.condition : '']
     .filter((x) => !!x && String(x).trim().length > 0)
     .map((x) => String(x).trim())
-  // Pass 1: full (no '#')
   const p1 = base.join(' ')
-  // Pass 2: drop condition (sometimes hurts matches)
   const p2 = [i.name, i.set, i.number].filter(Boolean).join(' ')
-  // Pass 3: name + number only
   const p3 = [i.name, i.number].filter(Boolean).join(' ')
-  // Deduplicate and keep non-empty
   const set = new Set([p1, p2, p3].map((s) => s.trim()).filter((s) => s.length > 0))
   return Array.from(set)
 }
 
-async function getLiveQuote(i: ItemIn, debug: boolean): Promise<{ price: number | null; count: number; passes?: EbayPass[] } | null> {
+async function getLiveQuote(i: ItemIn, debug: boolean): Promise<{ price: number | null; count: number; diag?: any[] } | null> {
   const appId = process.env.EBAY_APP_ID
-  if (!appId) return debug ? { price: null, count: 0, passes: [] } : null
+  if (!appId) return debug ? { price: null, count: 0, diag: [{ err: 'no-app-id' }] } : null
   const tries = buildKeywordPasses(i)
-  const passes: EbayPass[] = []
+  const diagAll: any[] = []
   for (const kw of tries) {
-    const r = await ebaySoldMedian(kw, appId)
-    passes.push({ keywords: kw, status: r.status, ack: r.ack, count: r.count })
-    if (r.price != null && r.count > 0) {
-      return debug ? { price: r.price, count: r.count, passes } : { price: r.price, count: r.count }
+    const r = await ebayFindCompleted(kw, appId)
+    diagAll.push({ keywords: kw, ...r.diag })
+    if (r.price != null && r.diag.count > 0) {
+      return debug ? { price: r.price, count: r.diag.count, diag: diagAll } : { price: r.price, count: r.diag.count }
     }
   }
-  return debug ? { price: null, count: 0, passes } : { price: null, count: 0 }
+  return debug ? { price: null, count: 0, diag: diagAll } : { price: null, count: 0 }
 }
 
 function nowISO(){ return new Date().toISOString() }
@@ -128,7 +150,7 @@ async function quoteFor(i: ItemIn, debug: boolean): Promise<{ q: Quote | null; m
   let price: number | null = null
 
   const live = await getLiveQuote(i, debug)
-  const meta: any = debug ? { appIdPresent: !!process.env.EBAY_APP_ID, passes: live?.passes ?? [] } : undefined
+  const meta: any = debug ? { appIdPresent: !!process.env.EBAY_APP_ID, passes: live?.diag ?? [] } : undefined
   if (live && live.price != null && live.count > 0) {
     price = live.price
     count = live.count
