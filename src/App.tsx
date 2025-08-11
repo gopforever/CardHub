@@ -129,15 +129,17 @@ function DemoWidget(){
 }
 
 /* =====================
-   Collections + Pricing
+   Collections + Pricing + UX wins
    ===================== */
 
 type Condition = 'Raw' | 'PSA 10' | 'PSA 9' | 'BGS 9.5' | 'Other'
 type CardItem = { id: string; name: string; set: string; number: string; condition: Condition; qty: number }
+
 type SortKey = 'name' | 'set' | 'number' | 'condition' | 'qty'
 type SortDir = 'asc' | 'desc'
 type BusyKind = 'idle' | 'import-csv' | 'restore-json' | 'pricing'
 
+/* Toasts with micro-animations */
 type ToastKind = 'success' | 'info' | 'error'
 type Toast = { id: string; kind: ToastKind; title: string; msg?: string; closing?: boolean }
 
@@ -159,6 +161,41 @@ function useToasts() {
     info:(t:string,m?:string)=>push('info',t,m),
     error:(t:string,m?:string)=>push('error',t,m),
     dismiss:startDismiss }
+}
+
+/* Price cache (localStorage) */
+type PriceData = { price: number; at: string } // at = ISO timestamp
+const PRICE_TTL_MS = 10 * 60 * 1000
+const PRICE_CACHE_KEY = 'ct_price_cache'
+
+function sigOf(name: string, set: string, number: string, condition?: string){
+  return [name, set, number, condition||'Raw'].map(s=>String(s||'').trim().toLowerCase()).join('|')
+}
+function sigOfItem(i: Pick<CardItem,'name'|'set'|'number'|'condition'>){ return sigOf(i.name, i.set, i.number, i.condition) }
+
+function loadPriceCache(): Record<string, PriceData> {
+  try { return JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || '{}') } catch { return {} }
+}
+function savePriceCache(data: Record<string, PriceData>){ localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(data)) }
+function priceCacheGet(sig: string): PriceData | null {
+  const data = loadPriceCache()[sig]
+  if (!data) return null
+  const age = Date.now() - new Date(data.at).getTime()
+  if (Number.isNaN(age)) return null
+  return { price: data.price, at: data.at }
+}
+function priceCacheSet(sig: string, p: PriceData){
+  const all = loadPriceCache()
+  all[sig] = p
+  savePriceCache(all)
+}
+function isStale(iso: string){ return (Date.now() - new Date(iso).getTime()) > PRICE_TTL_MS }
+function ageLabel(iso: string){
+  const diff = Date.now() - new Date(iso).getTime()
+  if (diff < 10_000) return 'Just now'
+  const mins = Math.floor(diff/60000); if (mins < 60) return mins + 'm ago'
+  const hrs = Math.floor(mins/60); if (hrs < 48) return hrs + 'h ago'
+  const days = Math.floor(hrs/24); return days + 'd ago'
 }
 
 function ToastViewport({ toasts, dismiss }:{ toasts: Toast[]; dismiss: (id: string)=>void }) {
@@ -190,7 +227,8 @@ function ToastCard({ toast, onDismiss }:{ toast: Toast; onDismiss: ()=>void }) {
   )
 }
 
-const csvEscape = (s: string) => `"${s.replace(/\"/g, '\"\"')}"`
+/* CSV helpers */
+const csvEscape = (s: string) => `"${s.replace(/"/g, '""')}"`
 function toCSV(rows: CardItem[]) {
   const header = ['name','set','number','condition','qty'].join(',')
   const body = rows.map((r: CardItem)=>[
@@ -231,24 +269,46 @@ function Collections(){
     name: '', set: '', number: '', condition: 'Raw', qty: 1
   })
 
+  // Filters + sorting
   const [search, setSearch] = useState('')
   const [condFilter, setCondFilter] = useState<Condition | 'All'>('All')
   const [sortKey, setSortKey] = useState<SortKey>('name')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
 
+  // Quick edit modal
   const [editing, setEditing] = useState<CardItem | null>(null)
   const [editDraft, setEditDraft] = useState<Omit<CardItem,'id'>>({ name:'', set:'', number:'', condition:'Raw', qty:1 })
 
+  // File inputs + busy state
   const [busy, setBusy] = useState<BusyKind>('idle')
   const csvInputRef = useRef<HTMLInputElement | null>(null)
   const jsonInputRef = useRef<HTMLInputElement | null>(null)
 
-  const [prices, setPrices] = useState<Record<string, number>>({})
+  // Row-level loading
+  const [rowLoading, setRowLoading] = useState<Record<string, boolean>>({})
 
+  // Pricing map: item.id -> PriceData
+  const [prices, setPrices] = useState<Record<string, PriceData>>({})
+
+  // Toasts
   const toasts = useToasts()
 
   useEffect(()=>{ localStorage.setItem('ct_items', JSON.stringify(items)) }, [items])
 
+  // On items change, hydrate prices from cache (for new items only, keep existing row prices)
+  useEffect(() => {
+    setPrices(prev => {
+      const next = { ...prev }
+      for (const it of items) {
+        if (next[it.id]) continue
+        const cached = priceCacheGet(sigOfItem(it))
+        if (cached) next[it.id] = cached
+      }
+      return next
+    })
+  }, [items])
+
+  // Derived list
   const visible = useMemo<CardItem[]>(() => {
     const q = search.trim().toLowerCase()
     const filtered = items.filter((i: CardItem) => {
@@ -288,21 +348,42 @@ function Collections(){
   }
   const saveEdit = () => {
     if (!editing) return
-    setItems(prev => prev.map(i => i.id === editing.id ? { ...i, ...editDraft } : i))
+    const updated: CardItem = { ...editing, ...editDraft }
+    setItems(prev => prev.map(i => i.id === editing.id ? updated : i))
+    // Refresh price from cache for the new signature (or clear if none)
+    const sig = sigOfItem(updated)
+    const cached = priceCacheGet(sig)
+    setPrices(prev => {
+      const next = { ...prev }
+      if (cached) next[updated.id] = cached
+      else delete next[updated.id]
+      return next
+    })
     setEditing(null)
     toasts.success('Changes saved')
   }
 
+  // Exporters
   const download = (filename: string, blob: Blob) => {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    a.href = url; a.download = filename
-    document.body.appendChild(a); a.click(); a.remove()
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
     URL.revokeObjectURL(url)
   }
-  const exportCSV = () => { download('collection.csv', new Blob([toCSV(items)], { type: 'text/csv;charset=utf-8;' })); toasts.info('CSV exported') }
-  const backupJSON = () => { download('collection-backup.json', new Blob([JSON.stringify(items, null, 2)], { type: 'application/json' })); toasts.info('Backup saved') }
+  const exportCSV = () => {
+    download('collection.csv', new Blob([toCSV(items)], { type: 'text/csv;charset=utf-8;' }))
+    toasts.info('CSV exported')
+  }
+  const backupJSON = () => {
+    download('collection-backup.json', new Blob([JSON.stringify(items, null, 2)], { type: 'application/json' }))
+    toasts.info('Backup saved')
+  }
 
+  // Importers with CSV dedupe
   const handleCSVChosen = async (file: File | null) => {
     if (!file) return
     setBusy('import-csv')
@@ -310,9 +391,38 @@ function Collections(){
       const text = await file.text()
       const rows = parseCSV(text)
       if (!rows.length) { toasts.error('Import failed', 'No valid rows. Headers: name,set,number,condition,qty'); return }
-      const mapped: CardItem[] = rows.map((r: Omit<CardItem,'id'>) => ({ id: crypto.randomUUID(), ...r }))
-      setItems(prev => [...prev, ...mapped])
-      toasts.success('Import complete', `${mapped.length} cards added`)
+
+      setItems(prev => {
+        const list = [...prev]
+        const existingIndex = new Map<string, number>()
+        prev.forEach((it, idx) => existingIndex.set(sigOfItem(it), idx))
+
+        const newIndex = new Map<string, number>()
+        let merged = 0, created = 0
+
+        for (const r of rows) {
+          const sig = sigOfItem({ ...r, id: '', qty: 0 } as CardItem)
+          const eIdx = existingIndex.get(sig)
+          if (eIdx != null) {
+            list[eIdx] = { ...list[eIdx], qty: list[eIdx].qty + r.qty }
+            merged++
+            continue
+          }
+          const nIdx = newIndex.get(sig)
+          if (nIdx != null) {
+            list[nIdx] = { ...list[nIdx], qty: list[nIdx].qty + r.qty }
+            merged++
+            continue
+          }
+          const item: CardItem = { id: crypto.randomUUID(), ...r }
+          list.push(item)
+          newIndex.set(sig, list.length - 1)
+          created++
+        }
+
+        toasts.success('Import complete', `${created} new, ${merged} merged`)
+        return list
+      })
     } catch {
       toasts.error('Import failed')
     } finally {
@@ -320,6 +430,7 @@ function Collections(){
       setBusy('idle')
     }
   }
+
   const restoreJSON = async (file: File | null) => {
     if (!file) return
     setBusy('restore-json')
@@ -336,7 +447,7 @@ function Collections(){
         qty: Math.max(0, Number(it.qty) || 0)
       })).filter((i: CardItem) => i.name)
       setItems(clean)
-      setPrices({})
+      setPrices({}) // reset pricing when restoring
       toasts.success('Restore complete', `${clean.length} cards loaded`)
     } catch {
       toasts.error('Restore failed', 'Invalid JSON backup file')
@@ -346,20 +457,37 @@ function Collections(){
     }
   }
 
-  type PriceResp = { ok: boolean; quotes: { id?: string; price: number }[] }
+  // Pricing
+  type PriceResp = { ok: boolean; quotes?: { id?: string; price: number; at: string }[]; quote?: { price: number; at: string } }
+  const setRowBusy = (id: string, busy: boolean) => setRowLoading(prev => ({ ...prev, [id]: busy }))
+
+  const updatePriceFor = (id: string, item: CardItem, price: number, at: string) => {
+    const sig = sigOfItem(item)
+    priceCacheSet(sig, { price, at })
+    setPrices(prev => ({ ...prev, [id]: { price, at } }))
+  }
+
   const refreshPrices = async () => {
     if (items.length === 0) { toasts.info('Nothing to price'); return }
     setBusy('pricing')
     try {
-      const payload = { items: items.map(i => ({ id: i.id, name: i.name, set: i.set, number: i.number, condition: i.condition })) }
-      const res = await fetch('/.netlify/functions/prices', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+      const payload = {
+        items: items.map(i => ({ id: i.id, name: i.name, set: i.set, number: i.number, condition: i.condition }))
+      }
+      const res = await fetch('/.netlify/functions/prices', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload)
+      })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = (await res.json()) as PriceResp
       if (!data.ok || !Array.isArray(data.quotes)) throw new Error('Malformed response')
-      const map: Record<string, number> = {}
-      for (const q of data.quotes) { if (!q.id) continue; map[q.id] = q.price }
-      setPrices(map)
-      toasts.success('Prices updated', `Fetched ${Object.keys(map).length} quotes`)
+
+      const now = new Date().toISOString()
+      for (const it of items) {
+        const q = data.quotes.find(q => q.id === it.id)
+        if (!q) continue
+        updatePriceFor(it.id, it, q.price, q.at || now)
+      }
+      toasts.success('Prices updated', `Fetched ${data.quotes.length} quotes`)
     } catch (e) {
       toasts.error('Pricing failed', e instanceof Error ? e.message : 'Unknown error')
     } finally {
@@ -367,8 +495,26 @@ function Collections(){
     }
   }
 
+  const refreshOne = async (it: CardItem) => {
+    setRowBusy(it.id, true)
+    try {
+      const qs = new URLSearchParams({ name: it.name, set: it.set, number: it.number, condition: it.condition })
+      const res = await fetch('/.netlify/functions/prices?' + qs.toString())
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = (await res.json()) as PriceResp
+      if (!data.ok || !data.quote) throw new Error('Malformed response')
+      const at = data.quote.at || new Date().toISOString()
+      updatePriceFor(it.id, it, data.quote.price, at)
+      toasts.success('Price updated')
+    } catch (e) {
+      toasts.error('Row pricing failed', e instanceof Error ? e.message : 'Unknown error')
+    } finally {
+      setRowBusy(it.id, false)
+    }
+  }
+
   const totalQty = items.reduce((a,b)=>a+b.qty,0)
-  const totalEst = items.reduce((sum, i)=> sum + (prices[i.id] || 0) * i.qty, 0)
+  const totalEst = items.reduce((sum, i)=> sum + (prices[i.id]?.price || 0) * i.qty, 0)
 
   const Th = ({ k, label }:{ k: SortKey; label: string }) => (
     <th className="px-4 py-2 cursor-pointer select-none" onClick={()=>onHeaderClick(k)}>
@@ -385,6 +531,7 @@ function Collections(){
     <div className="space-y-6 relative">
       <h1 className="text-3xl font-bold">My Collection</h1>
 
+      {/* Add row */}
       <div className="card p-4 space-y-4">
         <div className="grid md:grid-cols-5 gap-3">
           <input ref={nameInputRef} className="border rounded-xl px-3 py-2" placeholder="Card name" value={draft.name}
@@ -405,14 +552,21 @@ function Collections(){
         </div>
       </div>
 
+      {/* Toolbar */}
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="flex flex-wrap gap-3">
           <div className="relative">
             <div className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2"><IconSearch className="opacity-50" /></div>
-            <input className="border rounded-xl pl-10 pr-3 py-2 w-64" placeholder="Search name, set, #, condition" value={search}
-              onChange={(e)=>setSearch(e.target.value)} />
+            <input
+              className="border rounded-xl pl-10 pr-3 py-2 w-64"
+              placeholder="Search name, set, #, condition"
+              value={search}
+              onChange={(e)=>setSearch(e.target.value)}
+            />
           </div>
-          <select className="border rounded-xl px-3 py-2" value={condFilter} onChange={e=>setCondFilter(e.target.value as Condition|'All')}>
+          <select className="border rounded-xl px-3 py-2"
+                  value={condFilter}
+                  onChange={e=>setCondFilter(e.target.value as Condition|'All')}>
             <option value="All">All Conditions</option>
             <option>Raw</option><option>PSA 10</option><option>PSA 9</option><option>BGS 9.5</option><option>Other</option>
           </select>
@@ -429,6 +583,7 @@ function Collections(){
         </div>
       </div>
 
+      {/* Empty state */}
       {showEmpty ? (
         <div className="card p-10 grid place-items-center text-center text-slate-600">
           <div className="mb-4 text-slate-400"><IconBox className="w-12 h-12" /></div>
@@ -438,6 +593,7 @@ function Collections(){
         </div>
       ) : (
         <div className="card p-0 overflow-hidden relative">
+          {/* Busy overlay for bulk actions */}
           {busy !== 'idle' && (
             <div className="absolute inset-0 bg-white/70 backdrop-blur-sm grid place-items-center z-10">
               <div className="text-center">
@@ -463,50 +619,46 @@ function Collections(){
               </tr>
             </thead>
             <tbody>
-              {busy !== 'idle' && busy !== 'pricing' ? (
-                [...Array(5)].map((_, idx: number) => (
-                  <tr key={idx} className="border-t">
-                    {[...Array(6)].map((__, j: number)=>(
-                      <td key={j} className="px-4 py-3">
-                        <div className="h-4 w-32 bg-slate-200 rounded animate-pulse" />
-                      </td>
-                    ))}
-                    <td className="px-4 py-3 text-right">
-                      <div className="h-8 w-24 bg-slate-200 rounded-xl animate-pulse inline-block" />
+              {visible.map((i: CardItem) => {
+                const p = prices[i.id]
+                const isBusy = !!rowLoading[i.id] || (busy==='pricing' && !p)
+                const stale = p ? isStale(p.at) : false
+                return (
+                  <tr key={i.id} className="border-t hover:bg-slate-50">
+                    <td className="px-4 py-2">{i.name}</td>
+                    <td className="px-4 py-2">{i.set}</td>
+                    <td className="px-4 py-2">{i.number}</td>
+                    <td className="px-4 py-2">{i.condition}</td>
+                    <td className="px-4 py-2">
+                      {isBusy ? (
+                        <span className="inline-block h-6 w-28 rounded bg-slate-200 animate-pulse align-middle" />
+                      ) : p ? (
+                        <div className="flex items-center gap-2">
+                          <span className={`inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-sm border ${stale ? 'border-amber-200 bg-amber-50 text-amber-700' : 'border-emerald-200 bg-emerald-50 text-emerald-700'}`}>
+                            ${p.price.toFixed(2)} <span className="opacity-70">USD</span>
+                          </span>
+                          <span className={`text-xs ${stale ? 'text-amber-600' : 'text-slate-500'}`} title={new Date(p.at).toLocaleString()}>
+                            {ageLabel(p.at)}{stale ? ' • stale' : ''}
+                          </span>
+                          <button className="btn border px-2 py-1 text-xs" onClick={()=>refreshOne(i)} title="Refresh this row">
+                            <span className="inline-flex items-center gap-1"><IconRefresh /> Refresh</span>
+                          </button>
+                        </div>
+                      ) : (
+                        <button className="btn border px-2 py-1 text-xs" onClick={()=>refreshOne(i)} title="Get price">
+                          <span className="inline-flex items-center gap-1"><IconRefresh /> Get price</span>
+                        </button>
+                      )}
+                    </td>
+                    <td className="px-4 py-2">{i.qty}</td>
+                    <td className="px-4 py-2 text-right space-x-2">
+                      <button className="btn border" onClick={()=>openEdit(i)}>Edit</button>
+                      <button className="btn border" onClick={()=>remove(i.id)}>Remove</button>
                     </td>
                   </tr>
-                ))
-              ) : (
-                visible.map((i: CardItem) => {
-                  const price = prices[i.id]
-                  const hasPrice = typeof price === 'number' && !Number.isNaN(price)
-                  return (
-                    <tr key={i.id} className="border-t hover:bg-slate-50">
-                      <td className="px-4 py-2">{i.name}</td>
-                      <td className="px-4 py-2">{i.set}</td>
-                      <td className="px-4 py-2">{i.number}</td>
-                      <td className="px-4 py-2">{i.condition}</td>
-                      <td className="px-4 py-2">
-                        {busy==='pricing' && !hasPrice ? (
-                          <span className="inline-block h-6 w-20 rounded bg-slate-200 animate-pulse" />
-                        ) : hasPrice ? (
-                          <span className="inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-sm border border-emerald-200 bg-emerald-50 text-emerald-700">
-                            ${price.toFixed(2)} <span className="text-emerald-600/70">USD</span>
-                          </span>
-                        ) : (
-                          <span className="text-slate-400 text-sm">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2">{i.qty}</td>
-                      <td className="px-4 py-2 text-right space-x-2">
-                        <button className="btn border" onClick={()=>openEdit(i)}>Edit</button>
-                        <button className="btn border" onClick={()=>remove(i.id)}>Remove</button>
-                      </td>
-                    </tr>
-                  )
-                })
-              )}
-              {busy==='idle' && visible.length === 0 && !showEmpty && (
+                )
+              })}
+              {visible.length === 0 && (
                 <tr><td className="px-4 py-6 text-slate-500" colSpan={7}>No results. Try adjusting filters.</td></tr>
               )}
             </tbody>
@@ -514,7 +666,9 @@ function Collections(){
               <tfoot>
                 <tr className="border-t bg-slate-50">
                   <td className="px-4 py-2 font-semibold" colSpan={4}>Totals</td>
-                  <td className="px-4 py-2 font-semibold">Est. Value: ${totalEst.toFixed(2)}</td>
+                  <td className="px-4 py-2 font-semibold">
+                    Est. Value: ${totalEst.toFixed(2)}
+                  </td>
                   <td className="px-4 py-2 font-semibold">{totalQty}</td>
                   <td></td>
                 </tr>
@@ -524,6 +678,7 @@ function Collections(){
         </div>
       )}
 
+      {/* Quick Edit Modal */}
       {editing && (
         <Modal title="Edit Card" onClose={()=>setEditing(null)} actions={
           <>
@@ -548,6 +703,7 @@ function Collections(){
         </Modal>
       )}
 
+      {/* Toasts */}
       <ToastViewport toasts={toasts.toasts} dismiss={toasts.dismiss} />
     </div>
   )
@@ -581,7 +737,13 @@ function Footer(){
   )
 }
 
-function Modal({ title, children, actions, onClose }:{ title: string; children: React.ReactNode; actions?: React.ReactNode; onClose: ()=>void; }){
+/** Minimal Modal */
+function Modal({ title, children, actions, onClose }:{
+  title: string;
+  children: React.ReactNode;
+  actions?: React.ReactNode;
+  onClose: ()=>void;
+}){
   return (
     <div className="fixed inset-0 z-50">
       <div className="absolute inset-0 bg-black/30" onClick={onClose} />
@@ -599,12 +761,53 @@ function Modal({ title, children, actions, onClose }:{ title: string; children: 
   )
 }
 
-function IconCheck(){ return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M5 13l4 4L19 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>) }
-function IconX(){ return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>) }
-function IconInfo(){ return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 8h.01M11 12h1v5h1" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2"/></svg>) }
-function IconUpload({ className }:{className?:string}){ return (<svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 16V7m0 0l-3 3m3-3l3 3M5 20h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>) }
-function IconDownload({ className }:{className?:string}){ return (<svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 8v9m0 0l3-3m-3 3l-3-3M5 20h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>) }
-function IconBox({ className }:{className?:string}){ return (<svg className={className} viewBox="0 0 24 24" aria-hidden><path d="M3 7l9 4 9-4M3 7l9-4 9 4M3 7v10l9 4 9-4V7" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/></svg>) }
-function IconPlus({ className }:{className?:string}){ return (<svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>) }
-function IconSearch({ className }:{className?:string}){ return (<svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2"/><path d="M20 20l-3.5-3.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>) }
-function IconRefresh(){ return (<svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden><path d="M20 12a8 8 0 10-2.34 5.66M20 12v-6m0 6h-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>) }
+/* =====================
+   Inline Icons (SVG)
+   ===================== */
+function IconCheck(){ return (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M5 13l4 4L19 7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)}
+function IconX(){ return (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M18 6L6 18M6 6l12 12" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+  </svg>
+)}
+function IconInfo(){ return (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M12 8h.01M11 12h1v5h1" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="2"/>
+  </svg>
+)}
+function IconUpload({ className }:{className?:string}){ return (
+  <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M12 16V7m0 0l-3 3m3-3l3 3M5 20h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)}
+function IconDownload({ className }:{className?:string}){ return (
+  <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M12 8v9m0 0l3-3m-3 3l-3-3M5 20h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)}
+function IconBox({ className }:{className?:string}){ return (
+  <svg className={className} viewBox="0 0 24 24" aria-hidden>
+    <path d="M3 7l9 4 9-4M3 7l9-4 9 4M3 7v10l9 4 9-4V7" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)}
+function IconPlus({ className }:{className?:string}){ return (
+  <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+  </svg>
+)}
+function IconSearch({ className }:{className?:string}){ return (
+  <svg className={className} width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <circle cx="11" cy="11" r="7" stroke="currentColor" strokeWidth="2"/>
+    <path d="M20 20l-3.5-3.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+  </svg>
+)}
+function IconRefresh(){ return (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M20 12a8 8 0 10-2.34 5.66M20 12v-6m0 6h-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+  </svg>
+)}
