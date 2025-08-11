@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand: 33 150 243;
+}
+
+.container-responsive {
+  @apply max-w-7xl mx-auto px-4 sm:px-6 lg:px-8;
+}
+.card {
+  @apply rounded-2xl bg-white shadow-soft border border-slate-100;
+}
+.btn {
+  @apply inline-flex items-center gap-2 rounded-xl px-4 py-2 font-medium hover:opacity-90 transition;
+}
+.btn-primary {
+  @apply btn text-white;
+  background: rgb(var(--brand));
+}
+.nav-link {
+  @apply text-slate-600 hover:text-slate-900 transition;
+}
+.active-link {
+  @apply text-slate-900 font-semibold;
+}
