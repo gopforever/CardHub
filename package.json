@@ -8,13 +8,14 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview"
     {
-  "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "npm run typecheck && vite build",
-    "dev": "vite",
-    "preview": "vite preview"
-  }
+
+    "scripts": {
+  "typecheck": "tsc --noEmit -p tsconfig.json",
+  "build": "npm run typecheck && vite build",
+  "dev": "vite",
+  "preview": "vite preview"
 }
+
 
   },
   "dependencies": {
