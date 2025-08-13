@@ -1,18 +1,5 @@
-import type { Handler } from '@netlify/functions'
-
-/**
- * Prices via eBay Marketplace Insights (sold/completed) using OAuth Client Credentials.
- * - First tries MI: GET /buy/marketplace_insights/v1_beta/item_sales/search
- * - Falls back to Mock if MI not accessible/rate limited
- * - Caches OAuth token and quotes in-memory per lambda instance
- * ENV required:
- *   EBAY_CLIENT_ID
- *   EBAY_CLIENT_SECRET
- * Optional:
- *   EBAY_ENV = "production" | "sandbox" (default "production")
- *   EBAY_MI_SCOPE = space-separated scopes (default includes api_scope + buy.marketplace.insights)
- *   EBAY_DELAY_MS = polite delay between group calls in POST (default 800ms)
- */
+// No import from '@netlify/functions' so we don't need that package installed.
+// Netlify detects the named export `handler` in TS and bundles it automatically.
 
 type CacheVal = { price: number; at: string; exp: number; source: 'ebay-mi' | 'mock'; count?: number }
 const MEM: { map?: Map<string, CacheVal>, token?: { access_token: string, exp: number } } = (globalThis as any).__ct_price_mem || {}
@@ -55,11 +42,7 @@ async function getAppToken(): Promise<{ token?: string, error?: string }> {
   const now = Date.now()
   if (MEM.token && MEM.token.exp > now + 15000) return { token: MEM.token.access_token }
 
-  const body = new URLSearchParams({
-    grant_type: 'client_credentials',
-    scope
-  })
-
+  const body = new URLSearchParams({ grant_type: 'client_credentials', scope })
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
   const res = await fetch(`${base}/identity/v1/oauth2/token`, {
     method: 'POST',
@@ -91,7 +74,6 @@ async function miSearchSold(keywords: string): Promise<{ prices: number[], diag:
   const params = new URLSearchParams({
     q: keywords,
     limit: '50'
-    // You can add filters, e.g.: filter=lastSoldDate:[2025-05-01T00:00:00Z..2025-08-12T00:00:00Z]
   })
 
   const res = await fetch(`${base}/buy/marketplace_insights/v1_beta/item_sales/search?${params.toString()}`, {
@@ -106,19 +88,17 @@ async function miSearchSold(keywords: string): Promise<{ prices: number[], diag:
   if (!res.ok) {
     let hint = ''
     try { hint = (await res.text()).slice(0, 240) } catch {}
-    const limited = hint.includes('limit') or hint.lower().find if False else False  # placeholder; TS will ignore
+    const lower = hint.toLowerCase()
+    const limited = lower.includes('limit') || lower.includes('rate') || lower.includes('quota') || res.status === 429
     return { prices: [], diag: { status: res.status, count: 0, limited, bodyHint: hint } }
   }
 
   let data: any = {}
   try { data = await res.json() } catch { return { prices: [], diag: { status: 200, count: 0, bodyHint: 'bad-json' } } }
 
-  // Response shape: SalesHistoryPagedCollection<ItemSales>
-  // The array is typically in data.itemSales or data.salesHistory (naming differs across docs).
   const items = (data?.itemSales || data?.salesHistory || [])
   const prices: number[] = []
   for (const it of items) {
-    // Prefer lastSoldPrice.value, else price.value
     const p = Number(it?.lastSoldPrice?.value ?? it?.price?.value ?? NaN)
     if (Number.isFinite(p)) prices.push(p)
   }
@@ -127,7 +107,6 @@ async function miSearchSold(keywords: string): Promise<{ prices: number[], diag:
 
 /** ---------- helpers ---------- */
 function bestKeywords(i: ItemIn): string {
-  // Best quick pass: name + set + number
   return [i.name, i.set, i.number].filter(Boolean).map(s => String(s).trim()).join(' ')
 }
 
@@ -152,7 +131,6 @@ async function quoteFor(i: ItemIn, debug: boolean): Promise<{ q: Quote; meta?: a
   let price: number | null = null
   let meta: any = undefined
 
-  // Try MI first
   const kw = bestKeywords(i)
   if (kw && process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET) {
     const mi = await miSearchSold(kw)
@@ -187,7 +165,7 @@ function bad(statusCode: number, message: string){
   }
 }
 
-export const handler: Handler = async (event) => {
+export const handler = async (event: any) => {
   const debug = event.queryStringParameters?.debug === '1'
 
   if (event.httpMethod === 'GET') {
@@ -230,5 +208,4 @@ export const handler: Handler = async (event) => {
 
   return bad(405, 'Method not allowed')
 }
-
 export default handler
