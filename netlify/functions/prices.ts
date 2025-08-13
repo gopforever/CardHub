@@ -1,25 +1,29 @@
 import type { Handler } from '@netlify/functions'
 
 /**
- * Rate-limit–safe pricing function.
- * - Single best keyword pass (reduces calls)
- * - Detects eBay RateLimiter (errorId 10001) and stops further attempts
- * - Optional per-call delay via EBAY_DELAY_MS (default 1100ms)
- * - Dedupes items in bulk POST
- * - Returns { limited: boolean } if any call hit the rate limiter
+ * Prices via eBay Marketplace Insights (sold/completed) using OAuth Client Credentials.
+ * - First tries MI: GET /buy/marketplace_insights/v1_beta/item_sales/search
+ * - Falls back to Mock if MI not accessible/rate limited
+ * - Caches OAuth token and quotes in-memory per lambda instance
+ * ENV required:
+ *   EBAY_CLIENT_ID
+ *   EBAY_CLIENT_SECRET
+ * Optional:
+ *   EBAY_ENV = "production" | "sandbox" (default "production")
+ *   EBAY_MI_SCOPE = space-separated scopes (default includes api_scope + buy.marketplace.insights)
+ *   EBAY_DELAY_MS = polite delay between group calls in POST (default 800ms)
  */
 
-type CacheVal = { price: number; at: string; exp: number; source: 'ebay-sold' | 'mock'; count?: number }
-const MEM: { map?: Map<string, CacheVal> } = (globalThis as any).__ct_price_mem || {}
+type CacheVal = { price: number; at: string; exp: number; source: 'ebay-mi' | 'mock'; count?: number }
+const MEM: { map?: Map<string, CacheVal>, token?: { access_token: string, exp: number } } = (globalThis as any).__ct_price_mem || {}
 if (!MEM.map) MEM.map = new Map<string, CacheVal>()
 ;(globalThis as any).__ct_price_mem = MEM
 
 const TEN_MIN = 10 * 60 * 1000
-const DEFAULT_DELAY_MS = Number(process.env.EBAY_DELAY_MS || 1100)
+const DEFAULT_DELAY_MS = Number(process.env.EBAY_DELAY_MS || 800)
 
 type ItemIn = { id?: string; name: string; set?: string; number?: string; condition?: string }
-type Quote = { id?: string; price: number; at: string; source: 'ebay-sold' | 'mock'; count?: number }
-type Diag = { status: number; ack: string; count: number; limited?: boolean; bodyHint?: string }
+type Quote = { id?: string; price: number; at: string; source: 'ebay-mi' | 'mock'; count?: number }
 
 function sigOf(i: ItemIn): string {
   const parts = [i.name, i.set || '', i.number || '', i.condition || 'Raw']
@@ -33,63 +37,140 @@ function median(nums: number[]): number | null {
   return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2
 }
 
-function bestKeywords(i: ItemIn): string {
-  // Most successful for comps: name + set + number (no '#' and no condition)
-  const base = [i.name, i.set, i.number].filter(Boolean).map((s)=>String(s).trim())
-  return base.join(' ')
-}
+function nowISO(){ return new Date().toISOString() }
+const sleep = (ms:number)=> new Promise(r=>setTimeout(r, ms))
 
-async function ebayFindCompleted(keywords: string, appId: string): Promise<{ price: number | null; diag: Diag }> {
-  const endpoint = 'https://svcs.ebay.com/services/search/FindingService/v1'
-  const params = new URLSearchParams({
-    'OPERATION-NAME': 'findCompletedItems',
-    'SERVICE-VERSION': '1.13.0',
-    'RESPONSE-DATA-FORMAT': 'JSON',
-    'REST-PAYLOAD': 'true',
-    'GLOBAL-ID': 'EBAY-US',
-    'SECURITY-APPNAME': appId,
-    'keywords': keywords,
-    'paginationInput.entriesPerPage': '50',
-    'itemFilter(0).name': 'SoldItemsOnly',
-    'itemFilter(0).value': 'true'
+/** ---------- OAuth: Client Credentials ---------- */
+async function getAppToken(): Promise<{ token?: string, error?: string }> {
+  const clientId = process.env.EBAY_CLIENT_ID
+  const clientSecret = process.env.EBAY_CLIENT_SECRET
+  if (!clientId || !clientSecret) return { error: 'missing-ebay-credentials' }
+
+  const env = (process.env.EBAY_ENV || 'production').toLowerCase()
+  const base = env === 'sandbox' ? 'https://api.sandbox.ebay.com' : 'https://api.ebay.com'
+  const scope = process.env.EBAY_MI_SCOPE
+    || 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/buy.marketplace.insights'
+
+  // Reuse cached token if valid
+  const now = Date.now()
+  if (MEM.token && MEM.token.exp > now + 15000) return { token: MEM.token.access_token }
+
+  const body = new URLSearchParams({
+    grant_type: 'client_credentials',
+    scope
   })
 
-  const headers: Record<string,string> = {
-    'Accept': 'application/json',
-    'User-Agent': 'CardTrack/1.0 (+netlify)',
-    'X-EBAY-SOA-OPERATION-NAME': 'findCompletedItems',
-    'X-EBAY-SOA-SERVICE-VERSION': '1.13.0',
-    'X-EBAY-SOA-GLOBAL-ID': 'EBAY-US',
-    'X-EBAY-SOA-SECURITY-APPNAME': appId,
-    'X-EBAY-SOA-REQUEST-DATA-FORMAT': 'JSON',
-    'X-EBAY-SOA-RESPONSE-DATA-FORMAT': 'JSON'
-  }
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+  const res = await fetch(`${base}/identity/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${basic}`
+    },
+    body
+  })
 
-  const res = await fetch(`${endpoint}?${params.toString()}`, { method: 'GET', headers })
-  const status = res.status
+  if (!res.ok) {
+    const hint = await res.text().catch(()=> '')
+    return { error: `oauth-${res.status}: ${hint.slice(0,240)}` }
+  }
+  const data: any = await res.json().catch(()=> ({}))
+  if (!data?.access_token || !data?.expires_in) return { error: 'oauth-bad-json' }
+  MEM.token = { access_token: data.access_token, exp: now + (Number(data.expires_in) * 1000) }
+  return { token: data.access_token }
+}
+
+/** ---------- Marketplace Insights call ---------- */
+type MIDiag = { status: number; count: number; limited?: boolean; bodyHint?: string }
+async function miSearchSold(keywords: string): Promise<{ prices: number[], diag: MIDiag }> {
+  const env = (process.env.EBAY_ENV || 'production').toLowerCase()
+  const base = env === 'sandbox' ? 'https://api.sandbox.ebay.com' : 'https://api.ebay.com'
+  const { token, error } = await getAppToken()
+  if (!token) return { prices: [], diag: { status: 0, count: 0, bodyHint: error || 'no-token' } }
+
+  const params = new URLSearchParams({
+    q: keywords,
+    limit: '50'
+    // You can add filters, e.g.: filter=lastSoldDate:[2025-05-01T00:00:00Z..2025-08-12T00:00:00Z]
+  })
+
+  const res = await fetch(`${base}/buy/marketplace_insights/v1_beta/item_sales/search?${params.toString()}`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/json',
+      'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+    }
+  })
+
   if (!res.ok) {
     let hint = ''
     try { hint = (await res.text()).slice(0, 240) } catch {}
-    const limited = hint.includes('"errorId":["10001"') || hint.lower().find ? false : hint.includes('RateLimiter') // best-effort detect
-    return { price: null, diag: { status, ack: 'HTTP ' + status, count: 0, limited, bodyHint: hint } }
+    const limited = hint.includes('limit') or hint.lower().find if False else False  # placeholder; TS will ignore
+    return { prices: [], diag: { status: res.status, count: 0, limited, bodyHint: hint } }
   }
-  let data: any
-  try { data = await res.json() } catch (e: any) {
-    return { price: null, diag: { status, ack: 'Bad JSON', count: 0, bodyHint: (e?.message || 'parse error').slice(0,140) } }
-  }
-  const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0] ?? 'Unknown'
-  if (ack !== 'Success') return { price: null, diag: { status, ack, count: 0 } }
-  const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+
+  let data: any = {}
+  try { data = await res.json() } catch { return { prices: [], diag: { status: 200, count: 0, bodyHint: 'bad-json' } } }
+
+  // Response shape: SalesHistoryPagedCollection<ItemSales>
+  // The array is typically in data.itemSales or data.salesHistory (naming differs across docs).
+  const items = (data?.itemSales || data?.salesHistory || [])
   const prices: number[] = []
   for (const it of items) {
-    const priceStr = it?.sellingStatus?.[0]?.currentPrice?.[0]?.__value__ ?? it?.sellingStatus?.[0]?.convertedCurrentPrice?.[0]?.__value__
-    const p = priceStr != null ? Number(priceStr) : NaN
+    // Prefer lastSoldPrice.value, else price.value
+    const p = Number(it?.lastSoldPrice?.value ?? it?.price?.value ?? NaN)
     if (Number.isFinite(p)) prices.push(p)
   }
-  return { price: prices.length ? median(prices) : null, diag: { status, ack, count: prices.length } }
+  return { prices, diag: { status: 200, count: prices.length } }
 }
 
-function nowISO(){ return new Date().toISOString() }
+/** ---------- helpers ---------- */
+function bestKeywords(i: ItemIn): string {
+  // Best quick pass: name + set + number
+  return [i.name, i.set, i.number].filter(Boolean).map(s => String(s).trim()).join(' ')
+}
+
+function mockFromSig(sig: string){
+  let hash = 0
+  for (let c of sig) hash = ((hash << 5) - hash + c.charCodeAt(0)) | 0
+  const base = Math.abs(hash % 2000) / 10 + 1 // 1.0 .. 200.0
+  return Math.round(base * 100) / 100
+}
+
+async function quoteFor(i: ItemIn, debug: boolean): Promise<{ q: Quote; meta?: any }> {
+  const sig = sigOf(i)
+  const cached = MEM.map!.get(sig)
+  const now = Date.now()
+  if (cached && cached.exp > now) {
+    const q = { id: i.id, price: cached.price, at: cached.at, source: cached.source, count: cached.count }
+    return { q, meta: debug ? { cached: true } : undefined }
+  }
+
+  let source: 'ebay-mi' | 'mock' = 'mock'
+  let count = 0
+  let price: number | null = null
+  let meta: any = undefined
+
+  // Try MI first
+  const kw = bestKeywords(i)
+  if (kw && process.env.EBAY_CLIENT_ID && process.env.EBAY_CLIENT_SECRET) {
+    const mi = await miSearchSold(kw)
+    meta = debug ? { mi } : undefined
+    if (mi.prices.length) {
+      price = median(mi.prices)
+      count = mi.prices.length
+      source = 'ebay-mi'
+    }
+  }
+
+  if (price == null) price = mockFromSig(sig)
+
+  const at = nowISO()
+  MEM.map!.set(sig, { price, at, exp: now + TEN_MIN, source, count })
+  const q = { id: i.id, price, at, source, count }
+  return { q, meta }
+}
 
 function ok(body: any){
   return {
@@ -106,55 +187,16 @@ function bad(statusCode: number, message: string){
   }
 }
 
-function mockFromSig(sig: string){
-  let hash = 0
-  for (let c of sig) hash = ((hash << 5) - hash + c.charCodeAt(0)) | 0
-  const base = Math.abs(hash % 2000) / 10 + 1 // 1.0 .. 200.0
-  return Math.round(base * 100) / 100
-}
-
-const sleep = (ms:number)=> new Promise(r=>setTimeout(r, ms))
-
-async function quoteFor(i: ItemIn): Promise<{ q: Quote; limited: boolean }> {
-  const sig = sigOf(i)
-  const cached = MEM.map!.get(sig)
-  const now = Date.now()
-  if (cached && cached.exp > now) {
-    return { q: { id: i.id, price: cached.price, at: cached.at, source: cached.source, count: cached.count }, limited: false }
-  }
-
-  let source: 'ebay-sold' | 'mock' = 'mock'
-  let count = 0
-  let price: number | null = null
-  let limited = false
-
-  const appId = process.env.EBAY_APP_ID
-  if (appId) {
-    const kw = bestKeywords(i)
-    if (kw) {
-      const r = await ebayFindCompleted(kw, appId)
-      if (r.diag.limited) limited = true
-      if (r.price != null && r.diag.count > 0) {
-        price = r.price
-        count = r.diag.count
-        source = 'ebay-sold'
-      }
-    }
-  }
-
-  if (price == null) price = mockFromSig(sig)
-
-  const at = nowISO()
-  MEM.map!.set(sig, { price, at, exp: now + TEN_MIN, source, count })
-  return { q: { id: i.id, price, at, source, count }, limited }
-}
-
 export const handler: Handler = async (event) => {
+  const debug = event.queryStringParameters?.debug === '1'
+
   if (event.httpMethod === 'GET') {
     const { name = '', set = '', number = '', condition = '' } = event.queryStringParameters || {}
     if (!String(name).trim()) return bad(400, 'name is required')
-    const out = await quoteFor({ name: String(name), set: String(set), number: String(number), condition: String(condition) })
-    return ok({ ok: true, quote: out.q, limited: out.limited })
+
+    const item: ItemIn = { name: String(name), set: String(set), number: String(number), condition: String(condition) }
+    const { q, meta } = await quoteFor(item, debug)
+    return ok({ ok: true, quote: q, ...(debug ? { meta } : {}) })
   }
 
   if (event.httpMethod === 'POST') {
@@ -171,23 +213,16 @@ export const handler: Handler = async (event) => {
         arr.push(it); uniqMap.set(key, arr)
       }
 
-      const quotes: Quote[] = []
-      let limitedAny = false
-
-      for (const [key, group] of uniqMap.entries()) {
-        // Use the first representative to fetch
+      const out: Quote[] = []
+      for (const [_, group] of uniqMap.entries()) {
         const primary = group[0]
-        const { q, limited } = await quoteFor(primary)
-        limitedAny = limitedAny || limited
-        // assign price to all items in the group
+        const { q } = await quoteFor(primary, debug)
         for (const it of group) {
-          quotes.push({ id: it.id, price: q.price, at: q.at, source: q.source, count: q.count })
+          out.push({ id: it.id, price: q.price, at: q.at, source: q.source, count: q.count })
         }
-        // polite delay between eBay calls
         await sleep(DEFAULT_DELAY_MS)
       }
-
-      return ok({ ok: true, quotes, limited: limitedAny })
+      return ok({ ok: true, quotes: out })
     } catch {
       return ok({ ok: true, quotes: [] })
     }
